@@ -1,5 +1,5 @@
-﻿requests
 flask
-load_dotenv
+requests[socks]
+python-dotenv
 tiktoken
-gevent
+gunicorn
