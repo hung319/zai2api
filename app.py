@@ -1,4 +1,4 @@
-﻿#!/usr/bin/python
+#!/usr/bin/python
 # -*- coding: UTF-8 -*-
 """
 Z.ai 2 API
@@ -26,6 +26,16 @@ class cfg:
 		debug_msg = str(os.getenv("DEBUG_MSG", "false")).lower() == "true"
 		think = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
 		anon = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
+		key = str(os.getenv("API_KEY", "")).strip() # [NEW] API Key bảo vệ server
+
+	# [NEW] Cấu hình mạng / Proxy
+	class network:
+		proxy_url = str(os.getenv("PROXY_URL", "")).strip()
+		proxies = {
+			"http": proxy_url,
+			"https": proxy_url
+		} if proxy_url else None
+
 	class model:
 		default = str(os.getenv("MODEL", "glm-4.6"))
 		mapping = {}
@@ -52,9 +62,16 @@ cfg.headers["Referer"] = f"{cfg.source.protocol}//{cfg.source.host}/"
 # tiktoken 预加载
 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
 os.environ["TIKTOKEN_CACHE_DIR"] = cache_dir
-assert os.path.exists(os.path.join(cache_dir, "9b5ad71b2ce5302211f9c61530b329a4922fc6a4")) # cl100k_base.tiktoken
-import tiktoken
-enc = tiktoken.get_encoding("cl100k_base")
+# assert os.path.exists(os.path.join(cache_dir, "9b5ad71b2ce5302211f9c61530b329a4922fc6a4")) # cl100k_base.tiktoken
+try:
+    import tiktoken
+    enc = tiktoken.get_encoding("cl100k_base")
+except:
+    # Fallback nếu không load được tiktoken (tránh crash app nếu thiếu file)
+    class MockEnc:
+        def encode(self, text): return [0] * len(text)
+    enc = MockEnc()
+
 # 日志
 logging.basicConfig(
 	level=logging.DEBUG if cfg.api.debug_msg else logging.INFO,
@@ -65,6 +82,24 @@ log = logging.getLogger(__name__)
 # Flask 应用
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+
+# [NEW] Hàm kiểm tra API Key
+def check_auth():
+	if not cfg.api.key:
+		return None # Không cấu hình key thì cho qua
+	
+	auth_header = request.headers.get("Authorization", "")
+	# Hỗ trợ cả Bearer Token và sk-key trực tiếp (tùy client)
+	if not auth_header:
+		return make_response(jsonify({"error": "Unauthorized", "message": "Missing Authorization Header"}), 401)
+	
+	token = auth_header
+	if auth_header.startswith("Bearer "):
+		token = auth_header.split(" ")[1]
+	
+	if token != cfg.api.key:
+		return make_response(jsonify({"error": "Unauthorized", "message": "Invalid API Key"}), 401)
+	return None
 
 phaseBak = "thinking"
 # 工具函数
@@ -128,7 +163,8 @@ class utils:
 				query_string = urllib.parse.urlencode(params)
 				url = f"{url}?{query_string}"
 
-			return requests.post(url, json=data, headers=headers, stream=True)
+			# [MODIFIED] Thêm proxies
+			return requests.post(url, json=data, headers=headers, stream=True, proxies=cfg.network.proxies)
 
 		@staticmethod
 		def image(data_url, chat_id):
@@ -148,16 +184,17 @@ class utils:
 			}
 			headers = {
 				**cfg.headers,
-				"Authorization": f"Bearer {utils.request.user().get("token")}",
+				"Authorization": f"Bearer {utils.request.user().get('token')}",
 				"Referer": f"{cfg.source.protocol}//{cfg.source.host}/c/{chat_id}"
 			}
 
-			response = requests.post(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/files/", files=body, headers=headers)
+			# [MODIFIED] Thêm proxies
+			response = requests.post(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/files/", files=body, headers=headers, proxies=cfg.network.proxies)
 
 			if response.status_code == 200:
 				result = response.json()
 				log.debug("上传文件: %s -> %s_%s", filename, result.get("id"), result.get("filename"))
-				return f"{result.get("id")}_{result.get("filename")}"
+				return f"{result.get('id')}_{result.get('filename')}"
 			else:
 				raise Exception(f"image upload fail: {response.text}")
 
@@ -174,7 +211,8 @@ class utils:
 
 			# 发起一个简单的 GET 请求以触发 Set-Cookie
 			url = f"{cfg.source.protocol}//{cfg.source.host}"
-			response = requests.get(url, headers=cfg.headers)
+			# [MODIFIED] Thêm proxies
+			response = requests.get(url, headers=cfg.headers, proxies=cfg.network.proxies)
 
 			if response.status_code in (200, 301, 302, 401, 403):
 				# 提取 Set-Cookie 头（可能有多个）
@@ -216,7 +254,8 @@ class utils:
 			if not cfg.api.anon:
 				headers["Authorization"] = f"Bearer {cfg.source.token}"
 
-			response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/auths/", headers=headers)
+			# [MODIFIED] Thêm proxies
+			response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/auths/", headers=headers, proxies=cfg.network.proxies)
 			if response.status_code == 200:
 				data = response.json()
 				userName = data.get("name")
@@ -257,69 +296,6 @@ class utils:
 			signature_prarms = str(','.join([f"{k},{prarms[k]}" for k in sorted(prarms.keys())]))
 			signature_2_plaintext = f"{signature_prarms}|{content}|{str(request_time)}"
 			signature_2 = _hmac_sha256(signature_1.encode('utf-8'), signature_2_plaintext.encode('utf-8'))
-
-			# .......:.---*==**==+===-=-::.....   .::::.:.................:::.:-::-:-::.  
-			# .....:.::==:+--==--=---:-=:::..  .-=+++*+++++=-:.   ......:.::::.:-:----:.      
-			# ...:.....::--::-----::::.::::. .-+*************++-:. .::..:.:::-::----=-::.     
-			# ........:..:.:-=-----::::::...:+++************+++++-. ..:::.:::---:=====-..        
-			# .......:.::::=-=-----:::::::..=*++++**********+++++=:  .-::::::--=--++++=..      .
-			# ......::..:::=-=-----::-*-=:.:=*+++++==+++=+====+===:..::.::--::--==++++=:.    ..  
-			# ........:-:::::---::::-:=::: -+=+++==++=++======++==-...===:.:-----=+*+==:..       
-			# . ..:++++*--=-=##+*=::-::::--=************++*+++*+==-.:.-:-:.:::---=+%%%%=..      .
-			#   ...:-=:.::::-%#=-:...::.:=++****#*******++**#***++-:-:-+-:==:..:--*%@@@*.... .:--
-			# ..::::::::--:::=---::::::..+*+*******+===::-+*****+=::---=--::.:::----=++=-::::.-==
-			# ::::::::::::---:-:::-:--:---*++***+*****+==+++++++==::=-------=--------------------
-			# :::::::::---------------: .:+++***++=++*+*+=-=++++=--==============================
-			# :::::--------------------::--=+****: .:...:. -+*++-================================
-			# ::::--------------------------==***+-+*+++-:-+*+=-=++=++++==++===============++====
-			# ----------------------------===-=*#**++**+++***--..-=++++++++++++++++++++++++++++++
-			# --------------------============--+**********+-:-.   :+++++++++++++++++++++++++++=+
-			# ------------------=============-. .-=++++++=-::--:    .=+*++++++++++++++++++======+
-			# --------====------===========-:...::..:-:::::::---   ...:=+++++++++++++++++++++++==
-			# -------=================---:......-=::=+==+=-::--:........-=+**++++++++++++++++++++
-			# --------==--========--::......... :++++*++**=:::::=-........:-=++++++++++++++++++++
-			# -----=---====----::.............:--+********+=-:==:.............:::-=++++++++--++==
-			# ======.:.:=---=-........ .....:=+**+**###*****++=:...................-+*++**+*+++++
-			# ======:.-----==:....... ......-*******##********++=....................-++++++:-+++
-			# +++++*+++*+++-................=*******************+:....................=*+*+++++++
-			# +++++++++++*-................-+********************-................... -*+++++++++
-			# +++++++++++*-...............:=+********************-..............::::..=++++++++++
-			# ++++++++++++=...............:=+********************-...............:---:-++++++++++
-			# +++++++++++*= ............   .-*******************=..:...................++++++++++
-			# +++++++**++=:........  .....  -*++**************+=: .....................-+++++++++
-			# +++++++=-:....................=*+=+++++=++******=:   ....--...............-++++++++
-			# ++++++-......................:***+==---::-==+===-........::.. .............=+++++++
-			# ++++++........................***+=-::.. .:-----:.:-..... .................:+======
-			# +++++=........................-==-:..     ...::...:-........................-++++++
-			# ++++++..........................          .      ............................:+++++
-			# ++++++.........................        .....        .........................:+++++
-			# ++++++: ........................  ...........    ............................-*++++
-			# +++++*- ........................  ............   ............ ...............=+++++
-			# 哎呀！哎呀！哎呀呀呀！
-			# 哎↘呀哎↘↗呀哎呀呀呀
-			# junjie，jun 总啊！
-			# 您怎么就改了签名算法啊哎呀！
-			# 哎呀哎呀哎呀呀呀呀呀
-			# 太感谢我 jun 总了呀呀呀呀
-			# 太性情 太感谢 太通透了
-			# 直接就宣判了啊！
-			# 这可是带 hmac 的签名算法
-			# 砸到小户身上脸都是疼的~
-			# 祝开发此签名的开发者
-			# 学业工作都顺利
-			# 用苹果手机
-			# 开苹果汽车
-			# 住苹果房子
-			# 享苹果人生
-			# 你必定是
-			# 开兰博基尼
-			# 坐私人飞机
-			# 同时也祝您和您的家里人
-			# 身体健康
-			# 事业顺利
-			# 家庭幸福
-			# 在以后的人生里
-			# 购买力越来越苹果爆赞👍
 
 			log.debug("生成签名: %s", signature_2)
 			log.debug("  请求时间: %s", prarms.get("timestamp"))
@@ -391,7 +367,8 @@ class utils:
 				"Authorization": f"Bearer {current_token}",
 				"Content-Type": "application/json"
 			}
-			response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers)
+			# [MODIFIED] Thêm proxies
+			response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers, proxies=cfg.network.proxies)
 			if response.status_code == 200:
 				data = response.json()
 				models = []
@@ -512,7 +489,7 @@ class utils:
 							elif item.get("source", {}).get("data"):
 								source = item.get("source")
 								if source.get("type") == "base64" and source.get("data"):
-									media_url = f"data:{source.get("media_type", "image/jpeg")};base64,{source.get("data")}"
+									media_url = f"data:{source.get('media_type', 'image/jpeg')};base64,{source.get('data')}"
 
 							def truncate_values(obj, max_len=20):
 								if isinstance(obj, dict): return {k: truncate_values(v, max_len) for k, v in obj.items()}
@@ -757,6 +734,11 @@ class utils:
 def models():
 	if request.method == "OPTIONS":
 		return utils.request.response(make_response())
+	
+	# [NEW] Check auth
+	auth_error = check_auth()
+	if auth_error: return utils.request.response(auth_error)
+
 	try:
 		data = utils.request.models()
 		return utils.request.response(jsonify(data))
@@ -772,6 +754,10 @@ def OpenAI_Compatible():
 	try:
 		if request.method == "OPTIONS":
 			return utils.request.response(make_response())
+
+		# [NEW] Check auth
+		auth_error = check_auth()
+		if auth_error: return utils.request.response(auth_error)
 
 		odata = request.get_json(force=True, silent=True) or {}
 		# log.debug("收到请求:")
@@ -821,17 +807,17 @@ def OpenAI_Compatible():
 
 					# 构造 SSE 响应
 					yield f"data: {json.dumps({
-						"id": utils.request.id('chatcmpl'),
-						"object": "chat.completion.chunk",
-						"created": int(datetime.now().timestamp() * 1000),
-						"model": model,
-						"choices": [{
-							"index": 0,
-							"delta": delta,
-							"message": delta,
-							"finish_reason": None
+						'id': utils.request.id('chatcmpl'),
+						'object': 'chat.completion.chunk',
+						'created': int(datetime.now().timestamp() * 1000),
+						'model': model,
+						'choices': [{
+							'index': 0,
+							'delta': delta,
+							'message': delta,
+							'finish_reason': None
 						}]
-					})}\n\n"
+					}, ensure_ascii=False)}\n\n"
 
 				# 发送 finish_reason
 				yield f"data: {json.dumps({
@@ -845,7 +831,7 @@ def OpenAI_Compatible():
 						'message': {"role": "assistant"},
 						'finish_reason': "stop"
 					}]
-				})}\n\n"
+				}, ensure_ascii=False)}\n\n"
 
 				# 发送 usage
 				if include_usage:
@@ -862,7 +848,7 @@ def OpenAI_Compatible():
 							'completion_tokens': completion_tokens,
 							'total_tokens': prompt_tokens + completion_tokens
 						}
-					})}\n\n"
+					}, ensure_ascii=False)}\n\n"
 
 				yield "data: [DONE]\n\n"
 
@@ -931,6 +917,10 @@ def Anthropic_Compatible():
 		if request.method == "OPTIONS":
 			return utils.request.response(make_response())
 
+		# [NEW] Check auth
+		auth_error = check_auth()
+		if auth_error: return utils.request.response(auth_error)
+
 		odata = request.get_json(force=True, silent=True) or {}
 		log.debug("收到请求:")
 		log.debug("  data: %s", json.dumps(odata))
@@ -981,14 +971,14 @@ def Anthropic_Compatible():
 							'output_tokens': 0
 						}
 					}
-				})}\n\n"
+				}, ensure_ascii=False)}\n\n"
 
 				yield "event: content_block_start\n"
 				yield f"data: {json.dumps({
 					'type': 'content_block_start',
 					'index': 0,
 					'content_block': {'type': 'text', 'text': ''}
-				})}\n\n"
+				}, ensure_ascii=False)}\n\n"
 
 				yield "event: ping\n"
 				yield f"data: {json.dumps({'type': 'ping'})}\n\n"
@@ -1031,11 +1021,11 @@ def Anthropic_Compatible():
 									**tool_json,
 									"input": None
 								}
-							})}\n\n"
+							}, ensure_ascii=False)}\n\n"
 
 							# 发送 input（若存在）
 							if tool_json.get("input"):
-								input_json_str = json.dumps(tool_json["input"])
+								input_json_str = json.dumps(tool_json["input"], ensure_ascii=False)
 								chunk_size = 5  # 可根据需要调整
 								for i in range(0, len(input_json_str), chunk_size):
 									chunk = input_json_str[i:i + chunk_size]
@@ -1047,7 +1037,7 @@ def Anthropic_Compatible():
 											'type': 'input_json_delta',
 											'partial_json': chunk
 										}
-									})}\n\n"
+									}, ensure_ascii=False)}\n\n"
 
 							yield "event: content_block_stop\n"
 							yield f"data: {json.dumps({'type': 'content_block_stop', 'index': 1})}\n\n"
@@ -1066,7 +1056,7 @@ def Anthropic_Compatible():
 							'type': 'content_block_delta',
 							'index': 0,
 							'delta': {'type': 'text_delta', 'text': delta['text']}
-						})}\n\n"
+						}, ensure_ascii=False)}\n\n"
 
 				# 计算 completion_tokens
 				completion_str = "".join(text_parts)
@@ -1087,7 +1077,7 @@ def Anthropic_Compatible():
 						'usage': {
 							'output_tokens': completion_tokens
 						}
-					})}\n\n"
+					}, ensure_ascii=False)}\n\n"
 				else:
 					yield "event: message_delta\n"
 					yield f"data: {json.dumps({
@@ -1099,7 +1089,7 @@ def Anthropic_Compatible():
 						'usage': {
 							'output_tokens': completion_tokens
 						}
-					})}\n\n"
+					}, ensure_ascii=False)}\n\n"
 
 				yield "event: message_stop\n"
 				yield f"data: {json.dumps({'type': 'message_stop'})}\n\n"
@@ -1202,8 +1192,16 @@ if __name__ == "__main__":
 	log.info("基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 重构")
 	log.info("---------------------------------------------------------------------")
 	log.info("请稍后，正在检查网络……")
-	models = utils.request.models()
-	cookies = utils.request.cookies()
+	
+	# Fallback if network check fails on startup (optional, kept structure mostly same)
+	try:
+		models = utils.request.models()
+		cookies = utils.request.cookies()
+	except Exception as e:
+		log.error(f"Khởi động: Lỗi kết nối đến Z.ai (có thể do Proxy chưa thông?): {e}")
+		models = {}
+		cookies = None
+
 	log.info("---------------------------------------------------------------------")
 	log.info(f"Base           {cfg.source.protocol}//{cfg.source.host}")
 	log.info("Models         /v1/models")
@@ -1211,11 +1209,14 @@ if __name__ == "__main__":
 	log.info("Anthropic      /v1/messages")
 	log.info("---------------------------------------------------------------------")
 	log.info("服务端口：%s", cfg.api.port)
-	log.info("请求饼干：%s", cfg.headers["Cookie"]) if cookies else None
+	if cookies: log.info("请求饼干：%s", cfg.headers["Cookie"]) 
 	log.info("可用模型：%s", ", ".join([item["id"] for item in models.get("data", []) if "id" in item]))
 	log.info("备选模型：%s", cfg.model.default)
 	log.info("思考处理：%s", cfg.api.think)
 	log.info("访客模式：%s", cfg.api.anon)
+	# [NEW] Log API Key & Proxy status
+	log.info("API Key : %s", "Enabled (********)" if cfg.api.key else "Disabled (Public Access)")
+	log.info("Proxy   : %s", cfg.network.proxy_url if cfg.network.proxy_url else "Direct Connection")
 	log.info("调试模式：%s", cfg.api.debug)
 	log.info("调试信息：%s", cfg.api.debug_msg)
 	
