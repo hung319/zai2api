@@ -2,4 +2,5 @@ flask
 requests[socks]
 python-dotenv
 tiktoken
+gevent
 gunicorn
