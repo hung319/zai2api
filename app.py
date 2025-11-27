@@ -6,6 +6,9 @@ Z.ai 2 API
 基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 使用 AI 辅助重构。
 """
 
+from gevent import monkey
+monkey.patch_all()
+
 import os, re, json, base64, urllib.parse, requests, hashlib, hmac, uuid, traceback, logging
 from datetime import datetime
 from flask import Flask, request, Response, jsonify, make_response
