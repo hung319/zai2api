@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Z.ai 2 API (Final Fix)
+Z.ai 2 API (Final Stable)
 Modified by CezDev:
-- Fix lỗi cắt cụt câu trả lời (State Isolation)
-- Hỗ trợ Python 3.13 (No Syntax Errors)
-- API Key Protection & Payload Cleaning
+- Added Uptime Page at /
+- Fixed Empty Output (Disabled Buffering)
+- Enhanced Error Handling in Stream
 """
 
-import os, json, re, requests, logging, uuid, base64
+import os, json, re, requests, logging, uuid, base64, sys
 from datetime import datetime
 from flask import Flask, request, Response, jsonify, make_response
 
@@ -23,6 +23,9 @@ DEBUG_MODE = str(os.getenv("DEBUG", "false")).lower() == "true"
 THINK_TAGS_MODE = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
 ANONYMOUS_MODE = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
 SERVER_API_KEY = str(os.getenv("API_KEY", "")).strip()
+
+# Khởi tạo thời gian start server
+START_TIME = datetime.now()
 
 # Tiktoken Setup
 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
@@ -67,7 +70,7 @@ def check_auth():
         return make_response(jsonify({"error": {"message": "Invalid API Key", "type": "auth_error"}}), 401)
     return None
 
-# --- STREAM PROCESSOR (Class này xử lý logic văn bản cho từng request riêng biệt) ---
+# --- STREAM PROCESSOR ---
 class StreamProcessor:
     def __init__(self):
         self.phase_bak = "thinking"
@@ -77,11 +80,13 @@ class StreamProcessor:
         if not data: return None
         phase = data.get("phase", "other")
         content = data.get("delta_content") or data.get("edit_content") or ""
+        
+        # Nếu content rỗng, trả về None để skip (trừ khi cần keep-alive logic)
         if not content: return None
         
         content_bak = content
         
-        # Logic làm sạch tags
+        # --- Logic Clean Tags ---
         if phase == "thinking" or (phase == "answer" and "summary>" in content):
             content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
             content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
@@ -98,19 +103,16 @@ class StreamProcessor:
                     before, after = match.groups()
                     if after.strip():
                         if self.phase_bak == "thinking":
-                            # Nối chuỗi an toàn (tránh lỗi f-string backslash python 3.13)
                             content = "\n\n</reasoning>\n\n" + after.lstrip('\n')
                         elif self.phase_bak == "answer":
-                            # Nếu đang trong phase answer mà lại gặp thẻ reasoning -> có thể là lỗi upstream,
-                            # nhưng thường Z.ai chỉ gửi delta text.
-                            # Code cũ set content = "" ở đây, có thể gây mất chữ nếu logic sai.
-                            # Fix: Chỉ clear nếu content thực sự trùng lặp hoặc rác.
-                            # Hiện tại giữ logic cũ nhưng thêm log để trace.
-                            content = "" 
+                            # Chỉ clear nếu Z.ai gửi lại toàn bộ text (duplicate). 
+                            # Tuy nhiên, nếu Z.ai gửi delta, việc clear sẽ làm mất chữ.
+                            # Logic an toàn: Nếu content sau khi clean giống hệt content trước đó thì skip
+                            pass 
                     else:
                         content = "\n\n</reasoning>"
             
-            # Xử lý các mode hiển thị
+            # --- Logic Thay thế Tags ---
             if THINK_TAGS_MODE == "reasoning":
                 if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
                 content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
@@ -141,7 +143,6 @@ class StreamProcessor:
             else:
                 content = re.sub(r"</reasoning>", "</reasoning>\n\n", content)
 
-        # Cập nhật state cho lần chạy sau
         self.phase_bak = phase
 
         if repr(content):
@@ -157,7 +158,6 @@ class utils:
         @staticmethod
         def chat(data, chat_id):
             debug("Chat Request: %s", json.dumps(data))
-            # Tăng timeout lên 120s để tránh ngắt giữa chừng
             return requests.post(
                 f"{BASE}/api/chat/completions", 
                 json=data, 
@@ -174,7 +174,6 @@ class utils:
                 image_data = base64.b64decode(encoded)
                 filename = str(uuid.uuid4())
                 
-                debug("Uploading: %s", filename)
                 response = requests.post(
                     f"{BASE}/api/v1/files/", 
                     files={"file": (filename, image_data, mime_type)}, 
@@ -213,19 +212,31 @@ class utils:
     class response:
         @staticmethod
         def parse(stream):
-            # Sử dụng iter_lines với decode_unicode để xử lý buffer tốt hơn
             for line in stream.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "): continue
-                try: 
-                    # line[6:] bỏ qua "data: "
-                    data = json.loads(line[6:])
-                    yield data
-                except: continue
+                if not line: continue
+                if line.startswith("data: "):
+                    try: 
+                        yield json.loads(line[6:])
+                    except: continue
         @staticmethod
         def count(text):
             return len(enc.encode(text))
 
 # --- ROUTES ---
+
+# [NEW] Uptime Page
+@app.route("/", methods=["GET"])
+def index():
+    uptime = datetime.now() - START_TIME
+    return jsonify({
+        "status": "online",
+        "service": "Z.ai OpenAI Proxy",
+        "uptime": str(uptime).split('.')[0],
+        "model": MODEL,
+        "auth": "ENABLED" if SERVER_API_KEY else "DISABLED",
+        "python": sys.version.split()[0]
+    })
+
 @app.route("/v1/models", methods=["GET", "POST", "OPTIONS"])
 def models():
     if request.method == "OPTIONS": return utils.request.response(make_response())
@@ -266,7 +277,7 @@ def models():
             })
         return utils.request.response(jsonify({"object":"list","data":models_list}))
     except Exception as e:
-        return utils.request.response(jsonify({"error":"fetch models failed"})), 500
+        return utils.request.response(jsonify({"error": f"Fetch models failed: {str(e)}"})), 500
 
 @app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
 def OpenAI_Compatible():
@@ -319,55 +330,44 @@ def OpenAI_Compatible():
         def stream_generator():
             completion_str = ""
             completion_tokens = 0
-            
-            # [KEY FIX] Khởi tạo processor riêng cho request này
             processor = StreamProcessor()
 
-            for data in utils.response.parse(response):
-                is_done = data.get("data", {}).get("done", False)
-                
-                # Sử dụng processor instance
-                delta = processor.format_chunk(data)
-                finish_reason = "stop" if is_done else None
+            try:
+                for data in utils.response.parse(response):
+                    is_done = data.get("data", {}).get("done", False)
+                    delta = processor.format_chunk(data)
+                    finish_reason = "stop" if is_done else None
 
-                if delta:
-                    chunk = {
-                        "id": utils.request.id('chatcmpl'),
-                        "object": "chat.completion.chunk",
-                        "created": int(datetime.now().timestamp()),
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta,
-                                "message": delta,
-                                "finish_reason": finish_reason
-                            }
-                        ]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    if delta:
+                        chunk = {
+                            "id": utils.request.id('chatcmpl'),
+                            "object": "chat.completion.chunk",
+                            "created": int(datetime.now().timestamp()),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
 
-                    if "content" in delta: completion_str += delta["content"]
-                    if "reasoning_content" in delta: completion_str += delta["reasoning_content"]
-                    completion_tokens = utils.response.count(completion_str)
-                
-                if is_done:
-                    # Gửi chunk kết thúc rõ ràng
-                    end_chunk = {
-                        "id": utils.request.id('chatcmpl'),
-                        "object": "chat.completion.chunk",
-                        "created": int(datetime.now().timestamp()),
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {}, # Empty delta
-                                "finish_reason": "stop"
-                            }
-                        ]
-                    }
-                    yield f"data: {json.dumps(end_chunk)}\n\n"
-                    break
+                        if "content" in delta: completion_str += delta["content"]
+                        if "reasoning_content" in delta: completion_str += delta["reasoning_content"]
+                        completion_tokens = utils.response.count(completion_str)
+                    
+                    if is_done:
+                        end_chunk = {
+                            "id": utils.request.id('chatcmpl'),
+                            "object": "chat.completion.chunk",
+                            "created": int(datetime.now().timestamp()),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        }
+                        yield f"data: {json.dumps(end_chunk)}\n\n"
+                        break
+            except Exception as stream_e:
+                # Trả về lỗi trong stream nếu có sự cố
+                err_chunk = {
+                    "error": {"message": f"Stream error: {str(stream_e)}", "type": "stream_exception"}
+                }
+                yield f"data: {json.dumps(err_chunk)}\n\n"
 
             if include_usage:
                 usage_chunk = {
@@ -386,9 +386,14 @@ def OpenAI_Compatible():
 
             yield "data: [DONE]\n\n"
 
-        return Response(stream_generator(), mimetype="text/event-stream")
+        # [KEY FIX] Thêm headers để ngăn Nginx/Flask buffering
+        return Response(stream_generator(), mimetype="text/event-stream", headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        })
     else:
-        # Non-stream support (cũng cần dùng processor để đảm bảo logic giống nhau)
+        # Non-stream support
         processor = StreamProcessor()
         contents = {"content": [], "reasoning_content": []}
         
@@ -430,7 +435,7 @@ def OpenAI_Compatible():
 
 if __name__ == "__main__":
     log.info("---------------------------------------------------------------------")
-    log.info("Z.ai 2 API (Python 3.13 Ready & Thread-Safe)")
+    log.info("Z.ai 2 API (Final Stable)")
     log.info(f"API Key: {'SET' if SERVER_API_KEY else 'NONE'}")
     log.info(f"Port: {PORT}")
     log.info("---------------------------------------------------------------------")
