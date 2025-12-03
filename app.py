@@ -2,9 +2,9 @@
 # -*- coding: UTF-8 -*-
 """
 Z.ai 2 API (Refactored by CezDev)
-- Fix: Stream buffering issue (response cutting off).
-- Feature: Root health check.
-- Feature: Dynamic Random IP Spoofing per Request (X-Forwarded-For).
+- Standard: OpenAI Only (Removed Anthropic).
+- Fix: Stream buffering issue.
+- Feature: Dynamic Random IP Spoofing per Request.
 """
 
 from gevent import monkey
@@ -32,7 +32,7 @@ class cfg:
         port = int(os.getenv("PORT", "8080"))
         debug = str(os.getenv("DEBUG", "false")).lower() == "true"
         debug_msg = str(os.getenv("DEBUG_MSG", "false")).lower() == "true"
-        think = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
+        think = str(os.getenv("THINK_TAGS_MODE", "reasoning")) # 'reasoning' or 'ignore'
         anon = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
         key = str(os.getenv("API_KEY", "")).strip() 
 
@@ -42,7 +42,6 @@ class cfg:
             "http": proxy_url,
             "https": proxy_url
         } if proxy_url else None
-        # Lưu ý: Client IP giờ sẽ sinh động trong từng request, không config cứng ở đây nữa
 
     class model:
         default = str(os.getenv("MODEL", "glm-4.6"))
@@ -65,7 +64,7 @@ class cfg:
         "X-FE-Version": "prod-fe-1.0.111",
     }
 
-# Update Origin/Referer dynamic based on env
+# Update Origin/Referer dynamic
 cfg.base_headers["Origin"] = f"{cfg.source.protocol}//{cfg.source.host}"
 cfg.base_headers["Referer"] = f"{cfg.source.protocol}//{cfg.source.host}/"
 
@@ -108,14 +107,12 @@ def check_auth():
         return make_response(jsonify({"error": "Unauthorized", "message": "Invalid API Key"}), 401)
     return None
 
-phaseBak = "thinking"
-
 class utils:
     @staticmethod
     class request:
         @staticmethod
         def get_headers_with_ip():
-            """Sinh headers mới kèm IP ngẫu nhiên"""
+            """Sinh headers mới kèm IP ngẫu nhiên cho mỗi request"""
             current_ip = generate_random_ip()
             return {
                 **cfg.base_headers,
@@ -137,10 +134,7 @@ class utils:
                 "requestId": requestId,
             }
             
-            # Lấy header và IP ngẫu nhiên
             headers, current_ip = utils.request.get_headers_with_ip()
-            
-            # Cập nhật thêm các field đặc thù cho chat
             headers.update({
                 "Authorization": f"Bearer {userToken}",
                 "Content-Type": "application/json",
@@ -172,7 +166,7 @@ class utils:
                 params["signature_timestamp"] = signatures.get("timestamp")
                 data["signature_prompt"] = last_user_message
 
-            log.debug("Sending Chat Request with Random IP: %s", current_ip)
+            log.debug("Sending Chat Request with IP: %s", current_ip)
             
             url = f"{cfg.source.protocol}//{cfg.source.host}/api/chat/completions"
             if params:
@@ -192,8 +186,6 @@ class utils:
             image_data = base64.b64decode(encoded)
             filename = str(uuid.uuid4())
 
-            log.debug("Uploading file: %s", filename)
-
             body = {
                 "file": (filename, image_data, mime_type)
             }
@@ -204,8 +196,7 @@ class utils:
                  "Referer": f"{cfg.source.protocol}//{cfg.source.host}/c/{chat_id}"
             })
 
-            log.debug("Uploading Image with Random IP: %s", current_ip)
-
+            log.debug("Uploading Image with IP: %s", current_ip)
             response = requests.post(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/files/", files=body, headers=headers, proxies=cfg.network.proxies)
 
             if response.status_code == 200:
@@ -226,7 +217,7 @@ class utils:
             url = f"{cfg.source.protocol}//{cfg.source.host}"
             headers, current_ip = utils.request.get_headers_with_ip()
             
-            log.debug("Fetching Cookies with Random IP: %s", current_ip)
+            log.debug("Fetching Cookies with IP: %s", current_ip)
             response = requests.get(url, headers=headers, proxies=cfg.network.proxies)
 
             if response.status_code in (200, 301, 302, 401, 403):
@@ -260,7 +251,7 @@ class utils:
             if not cfg.api.anon:
                 headers["Authorization"] = f"Bearer {cfg.source.token}"
             
-            log.debug("Fetching User Info with Random IP: %s", current_ip)
+            log.debug("Fetching User Info with IP: %s", current_ip)
 
             response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/auths/", headers=headers, proxies=cfg.network.proxies)
             if response.status_code == 200:
@@ -315,7 +306,7 @@ class utils:
                 "Content-Type": "application/json"
             })
             
-            log.debug("Fetching Models with Random IP: %s", current_ip)
+            log.debug("Fetching Models with IP: %s", current_ip)
             
             response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers, proxies=cfg.network.proxies)
             
@@ -348,7 +339,8 @@ class utils:
             return resp
 
         @staticmethod
-        def format(data: Dict, type: str = "OpenAI"):
+        def format(data: Dict):
+            # Only keeping necessary OpenAI format logic
             odata = {**data.copy()}
             return odata
 
@@ -375,29 +367,24 @@ class utils:
                 log.error(f"Stream connection broken: {e}")
 
         @staticmethod
-        def format(data, type = "OpenAI"):
+        def format(data):
+            # [CLEANUP] Only OpenAI formatting logic
             data = data.get("data", "")
             if not data: return None
             phase = data.get("phase", "other")
             content = data.get("delta_content") or data.get("edit_content") or ""
             if not content: return None
             
-            global phaseBak
-
             if phase == "thinking" or (phase == "answer" and "summary>" in content):
                  content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
                  content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
 
             if phase == "tool_call": return {"tool_call": content}
             
-            if type == "Anthropic": 
-                if phase == "thinking" and cfg.api.think == "reasoning":
-                    return {"type": "thinking_delta", "thinking": content}
-                return {"type": "text_delta", "text": content}
-            else:
-                if phase == "thinking" and cfg.api.think == "reasoning":
-                     return {"role": "assistant", "reasoning_content": content}
-                return {"role": "assistant", "content": content}
+            # OpenAI Standard Return
+            if phase == "thinking" and cfg.api.think == "reasoning":
+                 return {"role": "assistant", "reasoning_content": content}
+            return {"role": "assistant", "content": content}
 
         @staticmethod
         def count(text):
@@ -408,12 +395,11 @@ class utils:
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
-    # Show a newly generated IP to prove the randomness
     current_fake_ip = generate_random_ip()
     return utils.request.response(jsonify({
         "status": "ok",
         "generated_ip_sample": current_fake_ip, 
-        "message": "Each request now uses a unique random IP.",
+        "mode": "OpenAI Only",
         "timestamp": int(datetime.now().timestamp() * 1000)
     }))
 
@@ -452,7 +438,7 @@ def OpenAI_Compatible():
         if stream:
             def generate_stream():
                 for raw_chunk in utils.response.parse(response):
-                    delta = utils.response.format(raw_chunk, "OpenAI")
+                    delta = utils.response.format(raw_chunk)
                     if delta:
                         yield f"data: {json.dumps({
                             'id': id,
@@ -473,7 +459,7 @@ def OpenAI_Compatible():
         else:
             content = []
             for raw_chunk in utils.response.parse(response):
-                delta = utils.response.format(raw_chunk, "OpenAI")
+                delta = utils.response.format(raw_chunk)
                 if delta and "content" in delta: content.append(delta["content"])
             
             return utils.request.response(jsonify({
@@ -486,15 +472,8 @@ def OpenAI_Compatible():
         log.error(traceback.format_exc())
         return utils.request.response(jsonify({"error": 500, "message": str(e)})), 500
 
-@app.route("/v1/messages", methods=["GET", "POST", "OPTIONS"])
-def Anthropic_Compatible():
-    if request.method == "OPTIONS": return utils.request.response(make_response())
-    auth_error = check_auth()
-    if auth_error: return utils.request.response(auth_error)
-    return make_response("Anthropic Endpoint Active", 200)
-
 if __name__ == "__main__":
-    log.info(f"Services Started on {cfg.api.port}")
+    log.info(f"Services Started on {cfg.api.port} (OpenAI Only Mode)")
     if cfg.api.debug:
         app.run(host="0.0.0.0", port=cfg.api.port, threaded=True, debug=True)
     else:
