@@ -2,9 +2,9 @@
 # -*- coding: UTF-8 -*-
 """
 Z.ai 2 API (Refactored by CezDev)
-- Standard: OpenAI Only (Removed Anthropic logic).
-- Fix: Restored Z.ai specific request formatting (Signatures, Image Upload).
-- Fix: Stream buffering issue & Dynamic Random IP.
+- Standard: OpenAI Only.
+- Fix V3: "Software caused connection abort" & Stream cutoff.
+- Tech: Uses stream_with_context + Anti-buffering headers.
 """
 
 from gevent import monkey
@@ -12,7 +12,7 @@ monkey.patch_all()
 
 import os, re, json, base64, urllib.parse, requests, hashlib, hmac, uuid, traceback, logging, random
 from datetime import datetime
-from flask import Flask, request, Response, jsonify, make_response
+from flask import Flask, request, Response, jsonify, make_response, stream_with_context
 from typing import Any, Dict, List, Union, Optional
 
 from dotenv import load_dotenv
@@ -105,7 +105,6 @@ class utils:
     class request:
         @staticmethod
         def get_headers_with_ip():
-            """Sinh header kèm IP ngẫu nhiên"""
             current_ip = generate_random_ip()
             return {
                 **cfg.headers,
@@ -117,7 +116,6 @@ class utils:
         def chat(data, chat_id):
             timestamp = int(datetime.now().timestamp() * 1000)
             requestId = str(uuid.uuid4())
-
             user = utils.request.user()
             userToken = user.get("token")
             userId = user.get("id")
@@ -137,7 +135,6 @@ class utils:
             if userId:
                 params["user_id"] = userId
                 last_user_message = ""
-                # Logic lấy message cuối cùng để ký signature (bắt buộc phải có)
                 for message in data.get("messages", []):
                     if message.get("role") and message.get("content"):
                         content = message.get("content")
@@ -160,24 +157,23 @@ class utils:
                 params["signature_timestamp"] = signatures.get("timestamp")
                 data["signature_prompt"] = last_user_message
 
-            log.debug("Sending Chat Request with IP: %s", current_ip)
+            log.debug("Stream Request Started [IP: %s]", current_ip)
             
             url = f"{cfg.source.protocol}//{cfg.source.host}/api/chat/completions"
             if params:
                 query_string = urllib.parse.urlencode(params)
                 url = f"{url}?{query_string}"
 
-            return requests.post(url, json=data, headers=headers, stream=True, proxies=cfg.network.proxies)
+            # [FIX] timeout set to avoid hanging forever, but None for read timeout in stream
+            return requests.post(url, json=data, headers=headers, stream=True, proxies=cfg.network.proxies, timeout=(10, None))
 
         @staticmethod
         def image(data_url, chat_id):
-            if cfg.api.anon or not data_url.startswith("data:"):
-                return None
+            if cfg.api.anon or not data_url.startswith("data:"): return None
             header, encoded = data_url.split(",", 1)
             mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
             image_data = base64.b64decode(encoded)
             filename = str(uuid.uuid4())
-
             body = {"file": (filename, image_data, mime_type)}
             
             headers, current_ip = utils.request.get_headers_with_ip()
@@ -186,9 +182,7 @@ class utils:
                 "Referer": f"{cfg.source.protocol}//{cfg.source.host}/c/{chat_id}"
             })
             
-            log.debug("Uploading Image with IP: %s", current_ip)
             response = requests.post(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/files/", files=body, headers=headers, proxies=cfg.network.proxies)
-
             if response.status_code == 200:
                 result = response.json()
                 return f"{result.get('id')}_{result.get('filename')}"
@@ -204,7 +198,7 @@ class utils:
             if cfg.headers.get("Cookie"): return cfg.headers["Cookie"]
             url = f"{cfg.source.protocol}//{cfg.source.host}"
             headers, _ = utils.request.get_headers_with_ip()
-            response = requests.get(url, headers=headers, proxies=cfg.network.proxies)
+            response = requests.get(url, headers=headers, proxies=cfg.network.proxies, timeout=10)
             if response.status_code in (200, 301, 302, 401, 403):
                 set_cookie_headers = response.headers.get_all('Set-Cookie') if hasattr(response.headers, 'get_all') else response.headers.get('Set-Cookie')
                 if set_cookie_headers:
@@ -227,7 +221,7 @@ class utils:
             headers["Content-Type"] = "application/json"
             if not cfg.api.anon: headers["Authorization"] = f"Bearer {cfg.source.token}"
             
-            response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/auths/", headers=headers, proxies=cfg.network.proxies)
+            response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/v1/auths/", headers=headers, proxies=cfg.network.proxies, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 userId = data.get("id")
@@ -247,12 +241,10 @@ class utils:
             request_time = int(prarms.get("timestamp", datetime.now().timestamp() * 1000))
             signature_expire = request_time // (5 * 60 * 1000)
             signature_1 = _hmac_sha256(b"key-@@@@)))()((9))-xxxx&&&%%%%%", str(signature_expire).encode('utf-8'))
-
             content = base64.b64encode(content.encode('utf-8')).decode('ascii')
             signature_prarms = str(','.join([f"{k},{prarms[k]}" for k in sorted(prarms.keys())]))
             signature_2_plaintext = f"{signature_prarms}|{content}|{str(request_time)}"
             signature_2 = _hmac_sha256(signature_1.encode('utf-8'), signature_2_plaintext.encode('utf-8'))
-
             return {"signature": signature_2, "timestamp": request_time}
 
         _models_cache = {}
@@ -263,15 +255,13 @@ class utils:
             headers, _ = utils.request.get_headers_with_ip()
             headers.update({"Authorization": f"Bearer {current_token}", "Content-Type": "application/json"})
             
-            response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers, proxies=cfg.network.proxies)
+            response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers, proxies=cfg.network.proxies, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 models = []
-                # Simple Model Mapping Logic to keep file small but functional
                 for m in data.get("data", []):
                     if not m.get("info", {}).get("is_active", True): continue
                     model_id = m.get("id")
-                    # Smart Name Logic
                     name = m.get("name", model_id)
                     models.append({
                         "id": model_id, "object": "model", "name": name,
@@ -293,7 +283,6 @@ class utils:
             })
             return resp
 
-        # [RESTORED] Logic format request quan trọng từ file gốc
         @staticmethod
         def format(data: Dict):
             odata = {**data.copy()}
@@ -301,21 +290,18 @@ class utils:
             chat_id = odata.get("chat_id")
             model = odata.get("model", cfg.model.default)
 
-            # Map model name
             if hasattr(cfg.model, 'mapping') and model:
                 for source_id, mapped_id in cfg.model.mapping.items():
                     if mapped_id == model and model != source_id:
                         model = source_id
                         break
 
-            # Convert System Prompt to Message
             if "system" in odata:
                 systems = odata["system"]
                 content = systems if isinstance(systems, str) else "\n\n".join([item.get("text", "") for item in systems])
                 new_messages.append({"role": "system", "content": content.lstrip('\n')})
                 del odata["system"]
 
-            # Process Messages & Images
             for message in odata.get("messages", []):
                 role = message.get("role")
                 content = message.get("content", [])
@@ -342,7 +328,6 @@ class utils:
                                     log.error(f"Image upload failed: {e}")
                                     continue
                             new_content.append({"type": "image_url", "image_url": {"url": media_url}})
-                    
                     if new_content:
                         new_message["content"] = new_content
                         new_messages.append(new_message)
@@ -359,41 +344,53 @@ class utils:
     class response:
         @staticmethod
         def parse(stream):
-            # [FIX] chunk_size=None để fix lỗi buffering
+            # [FIX] Enhanced Robust Parser
+            # Sử dụng iter_lines với chunk_size=None để xử lý từng dòng ngay khi nhận được
+            # Bắt lỗi decode_error="replace" để tránh crash stream nếu gặp ký tự lạ
             try:
-                for line in stream.iter_lines(chunk_size=None): 
-                    if not line: continue
-                    if not line.startswith(b"data: "): continue
-                    try: 
-                        yield json.loads(line[6:].decode("utf-8", "ignore"))
-                    except: continue
+                for line in stream.iter_lines(chunk_size=None, decode_unicode=False): 
+                    if not line: 
+                        continue # Keep-alive or empty line
+                    
+                    if not line.startswith(b"data: "): 
+                        continue
+                        
+                    try:
+                        # Decode safe
+                        decoded_line = line[6:].decode("utf-8", "replace")
+                        if decoded_line.strip() == "[DONE]":
+                            yield {"data": {"done": True}}
+                            break
+                        yield json.loads(decoded_line)
+                    except json.JSONDecodeError:
+                        continue 
             except Exception as e:
-                log.error(f"Stream error: {e}")
+                log.error(f"Stream broken during iteration: {e}")
+                # Không raise error để flask kết thúc stream gracefully
 
         @staticmethod
         def format(data):
-            # [RESTORED] Logic xử lý tag thinking/reasoning
             data = data.get("data", "")
             if not data: return None
+            # Handle done signal manually if needed
+            if isinstance(data, dict) and data.get("done"): return None
+
             phase = data.get("phase", "other")
             content = data.get("delta_content") or data.get("edit_content") or ""
             if not content: return None
             
             global phaseBak
             
-            # Clean Z.ai specific tags
             if phase == "thinking" or (phase == "answer" and "summary>" in content):
                  content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
                  content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
 
             if phase == "thinking":
                 content = re.sub(r'\n*<summary>.*?</summary>\n*', '\n\n', content)
-                content = re.sub(r"<details[^>]*>\n*", "", content) # Strip details for OpenAI mode
+                content = re.sub(r"<details[^>]*>\n*", "", content)
 
             phaseBak = phase
-
             if phase == "tool_call": return {"tool_call": content}
-            
             if phase == "thinking" and cfg.api.think == "reasoning":
                  return {"role": "assistant", "reasoning_content": content}
             return {"role": "assistant", "content": content}
@@ -410,7 +407,7 @@ def health():
     return utils.request.response(jsonify({
         "status": "ok",
         "mode": "OpenAI Only",
-        "generated_ip_sample": generate_random_ip(),
+        "ip_check": generate_random_ip(),
         "timestamp": int(datetime.now().timestamp() * 1000)
     }))
 
@@ -436,7 +433,6 @@ def OpenAI_Compatible():
         id = utils.request.id("chat")
         stream = odata.get("stream", False)
         
-        # Format request dùng logic chuẩn Z.ai
         data = {
             **utils.request.format(odata),
             "chat_id": id,
@@ -448,26 +444,46 @@ def OpenAI_Compatible():
              return utils.request.response(jsonify({"error": response.text})), response.status_code
 
         if stream:
+            # [FIX] Sử dụng stream_with_context để giữ request context
+            @stream_with_context 
             def generate_stream():
-                for raw_chunk in utils.response.parse(response):
-                    delta = utils.response.format(raw_chunk)
-                    if delta:
-                        yield f"data: {json.dumps({
-                            'id': id,
-                            'object': 'chat.completion.chunk',
-                            'created': int(datetime.now().timestamp()),
-                            'model': data.get('model'),
-                            'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]
-                        }, ensure_ascii=False)}\n\n"
-                
-                yield f"data: {json.dumps({
-                    'id': id, 
-                    'object': 'chat.completion.chunk',
-                    'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]
-                })}\n\n"
-                yield "data: [DONE]\n\n"
+                try:
+                    for raw_chunk in utils.response.parse(response):
+                        # Check done signal
+                        if raw_chunk.get("data", {}).get("done"):
+                            break
 
-            return Response(generate_stream(), mimetype="text/event-stream")
+                        delta = utils.response.format(raw_chunk)
+                        if delta:
+                            yield f"data: {json.dumps({
+                                'id': id,
+                                'object': 'chat.completion.chunk',
+                                'created': int(datetime.now().timestamp()),
+                                'model': data.get('model'),
+                                'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]
+                            }, ensure_ascii=False)}\n\n"
+                    
+                    # End of stream properly
+                    yield f"data: {json.dumps({
+                        'id': id, 
+                        'object': 'chat.completion.chunk',
+                        'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]
+                    })}\n\n"
+                    yield "data: [DONE]\n\n"
+                except GeneratorExit:
+                    log.info("Client disconnected stream")
+                    response.close()
+                except Exception as e:
+                    log.error(f"Generation error: {e}")
+                    # Try to send error to client if still connected
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+            # [FIX] Add Headers to prevent buffering by Proxy/Nginx
+            resp = Response(generate_stream(), mimetype="text/event-stream")
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["X-Accel-Buffering"] = "no" # Quan trọng cho Nginx
+            resp.headers["Connection"] = "keep-alive"
+            return utils.request.response(resp)
         else:
             content = []
             reasoning = []
